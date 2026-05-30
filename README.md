@@ -117,6 +117,21 @@ python main.py "https://www.youtube.com/watch?v=VIDEO_ID" \
     --output-json result.json
 ```
 
+### Fixed-length shorts (e.g. 30s for TikTok)
+
+By default the LLM picks clip lengths from a 45–90 second sweet spot. To force every short to be exactly the same length, pass `--clip-duration`:
+
+```bash
+# Three 30-second shorts
+python main.py "https://www.youtube.com/watch?v=VIDEO_ID" --clip-duration 30
+
+# Five 15-second cuts
+python main.py "https://www.youtube.com/watch?v=VIDEO_ID" \
+    --clip-duration 15 --num-clips 5
+```
+
+The LLM still picks the best start point; the pipeline then trims/extends each highlight to exactly the requested duration (clamped to the source-video end so nothing runs past the file).
+
 ### Local file or path
 
 In `--mode local`, you can pass a `file://` URL or a direct filesystem path and skip YouTube entirely:
@@ -163,6 +178,7 @@ xargs -a urls.txt -I{} python main.py "{}"
 |------|---------|-------|
 | `--mode` | `api` | `api` (MuAPI, fast, no setup) or `local` (remote URL, `file://`, or local path + faster-whisper + LLM provider + ffmpeg) |
 | `--num-clips` | `3` | How many shorts to render |
+| `--clip-duration` | — | Force every short to be exactly this many seconds (e.g. `30`). Default: LLM picks from a 45–90s sweet spot |
 | `--aspect-ratio` | `9:16` | Any ratio; `9:16` for TikTok/Reels, `1:1` for square |
 | `--format` | `720` | Source download resolution: `360` / `480` / `720` / `1080` |
 | `--language` | auto | Force Whisper language code (e.g. `en`) |
@@ -236,6 +252,7 @@ Highlights:    7 candidates → kept top 3
 Edit `shorts_generator/highlights.py`:
 - **Virality framework**: `VIRALITY_CRITERIA` — the ranked list of signals the LLM optimizes for
 - **System prompt**: `HIGHLIGHT_SYSTEM_PROMPT` — duration sweet spot, hook rules, JSON schema
+- **Fixed-length output**: pass `clip_duration=30` to `generate_shorts(...)` (or `--clip-duration 30` on the CLI) to snap every clip to exactly that length via `snap_highlights_to_duration()`
 - **Chunk size**: `CHUNK_SIZE_SECONDS` (default 1200) — chunk length for long videos
 - **Long-video threshold**: `LONG_VIDEO_THRESHOLD` (default 1800) — videos longer than this are chunked
 - **Chunk overlap**: `CHUNK_OVERLAP_SECONDS` (default 60) — overlap between chunks so cross-boundary clips aren't missed

@@ -12,12 +12,13 @@ drive either MuAPI (default, --mode api) or a direct local LLM client
 """
 import json
 import re
-from typing import Callable, Dict, List, Optional
+from typing import Callable, Dict, List, Optional, Tuple
 
 from . import muapi
 
 
 LLMFn = Callable[[str], str]
+ClipDurationRange = Optional[Tuple[float, float]]
 
 
 CONTENT_TYPE_PROMPT = """Analyze this video transcript sample and classify the content type.
@@ -68,24 +69,31 @@ DEFAULT_DURATION_RULES = (
 )
 
 
-def _duration_rules(clip_duration: Optional[float]) -> str:
+def _duration_rules(clip_duration: ClipDurationRange) -> str:
     """Build the duration-rules paragraph injected into the highlight prompt.
 
-    When `clip_duration` is set, we also snap clips to exactly that length
-    after the LLM step — but it still helps to nudge the LLM to pick start
-    points that read well at the target duration.
+    `clip_duration` is None or a (min, max) tuple. When set we also clamp
+    clips to the range after the LLM step — but it still helps to nudge the
+    LLM to pick start points that read well at the target length.
     """
-    if not clip_duration or clip_duration <= 0:
+    if not clip_duration:
         return DEFAULT_DURATION_RULES
-    target = float(clip_duration)
-    lower = max(5.0, target * 0.85)
-    upper = target * 1.15
+    lo, hi = clip_duration
+    if lo == hi:
+        target = lo
+        return (
+            f"Target duration: exactly {target:.0f} seconds per clip. "
+            f"Each clip will be trimmed to {target:.0f} seconds afterwards, "
+            f"so pick a start_time where the hook lands in the first 3 "
+            f"seconds and the next {target:.0f} seconds stay self-contained"
+        )
     return (
-        f"Target duration: {target:.0f} seconds per clip. Aim for {lower:.0f}-"
-        f"{upper:.0f} seconds when picking start/end. Each clip will be trimmed "
-        f"to exactly {target:.0f} seconds afterwards, so pick a start_time where "
-        f"the hook lands in the first 3 seconds and the next {target:.0f} seconds "
-        f"stay self-contained"
+        f"Target duration: {lo:.0f}-{hi:.0f} seconds per clip. Each clip "
+        f"will be clamped to fall inside {lo:.0f}-{hi:.0f} seconds afterwards "
+        f"(in-range picks are kept as-is, shorter clips are extended to "
+        f"{lo:.0f}s, longer clips are trimmed to {hi:.0f}s), so pick a "
+        f"start_time where the hook lands in the first 3 seconds and the "
+        f"next {lo:.0f}-{hi:.0f} seconds stay self-contained"
     )
 
 
@@ -181,7 +189,7 @@ def call_highlight_api(
     num_clips: int,
     is_chunk: bool = False,
     llm_fn: LLMFn = call_muapi_llm,
-    clip_duration: Optional[float] = None,
+    clip_duration: ClipDurationRange = None,
 ) -> Dict:
     # Ask for ~2× the user's target so dedupe has headroom, but cap so the model
     # doesn't have to generate a huge JSON payload (which times out gpt-5-mini).
@@ -223,29 +231,48 @@ def dedupe_highlights(highlights: List[Dict]) -> List[Dict]:
 
 def snap_highlights_to_duration(
     highlights: List[Dict],
-    clip_duration: float,
+    clip_duration: ClipDurationRange,
     transcript_duration: Optional[float] = None,
 ) -> List[Dict]:
-    """Force every highlight to be exactly `clip_duration` seconds long.
+    """Clamp every highlight's length into the requested range.
 
-    LLMs are unreliable at hitting exact durations, so when the caller asks
-    for (e.g.) 30-second shorts we anchor on the highlight's start_time and
-    extend/trim to exactly that length. If the highlight runs past the end
-    of the source video, we shift the window backward so the clip stays
-    in-bounds and still ends at the source duration.
+    `clip_duration` is None (no-op) or a (min, max) tuple in seconds:
+      - In-range LLM picks are left untouched.
+      - Highlights shorter than `min` are extended (anchored at start_time)
+        to exactly `min`.
+      - Highlights longer than `max` are trimmed (anchored at start_time)
+        to exactly `max`.
+      - If the resulting window runs past the source video end, it shifts
+        backward so it ends at `transcript_duration` while keeping a length
+        inside [min, max] when possible.
+
+    Passing a fixed length (e.g. (30, 30)) reproduces the old behavior of
+    forcing every short to exactly 30 seconds.
     """
-    if not clip_duration or clip_duration <= 0:
+    if not clip_duration:
         return highlights
+    lo, hi = clip_duration
     snapped: List[Dict] = []
     for h in highlights:
         start = float(h["start_time"])
-        end = start + float(clip_duration)
+        end = float(h["end_time"])
+        dur = end - start
+
+        if dur < lo:
+            end = start + lo
+        elif dur > hi:
+            end = start + hi
+        # else: in range — keep the LLM's pick as-is.
+
+        # Keep the window inside the source video.
         if transcript_duration is not None and end > transcript_duration:
             end = float(transcript_duration)
-            start = max(0.0, end - float(clip_duration))
+            target_dur = max(lo, min(hi, end - start))
+            start = max(0.0, end - target_dur)
         if start < 0:
             start = 0.0
-            end = start + float(clip_duration)
+            end = start + lo
+
         snapped.append({**h, "start_time": start, "end_time": end})
     return snapped
 
@@ -254,22 +281,25 @@ def get_highlights(
     transcript: Dict,
     num_clips: int = 3,
     llm_fn: Optional[LLMFn] = None,
-    clip_duration: Optional[float] = None,
+    clip_duration: ClipDurationRange = None,
 ) -> Dict:
     """Main entry point — returns {highlights: [...]} sorted by score.
 
     `llm_fn` swaps the underlying LLM. Defaults to MuAPI gpt-5-mini; local
     mode passes in a local LLM-backed callable.
 
-    `clip_duration` (seconds), when set, both nudges the LLM toward that
-    target and snaps every returned highlight to exactly that length.
+    `clip_duration` is None or a (min_seconds, max_seconds) tuple. When set,
+    we both nudge the LLM toward that range and clamp every returned
+    highlight into it (in-range picks pass through untouched).
     """
     llm_fn = llm_fn or call_muapi_llm
     duration = transcript.get("duration", 0)
     content_info = detect_content_type(transcript, llm_fn=llm_fn)
     print(f"[highlights] content={content_info.get('content_type')} density={content_info.get('density')} duration={duration:.0f}s", flush=True)
     if clip_duration:
-        print(f"[highlights] target clip duration: {clip_duration:.0f}s (will snap after LLM)", flush=True)
+        lo, hi = clip_duration
+        label = f"{lo:.0f}s" if lo == hi else f"{lo:.0f}-{hi:.0f}s"
+        print(f"[highlights] target clip duration: {label} (will clamp after LLM)", flush=True)
 
     if duration >= LONG_VIDEO_THRESHOLD:
         chunks = chunk_transcript(transcript)

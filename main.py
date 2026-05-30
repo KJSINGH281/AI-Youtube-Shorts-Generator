@@ -18,6 +18,35 @@ if hasattr(sys.stderr, "reconfigure"):
 from shorts_generator import generate_shorts
 
 
+def _parse_clip_duration(value: str):
+    """Argparse type for --clip-duration.
+
+    Accepts either a single value ('30') or a range ('30-45') and returns a
+    (min_seconds, max_seconds) tuple in both cases. The downstream pipeline
+    only deals with the tuple form.
+    """
+    s = value.strip()
+    try:
+        if "-" in s:
+            lo_str, hi_str = s.split("-", 1)
+            lo, hi = float(lo_str), float(hi_str)
+        else:
+            lo = hi = float(s)
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError(
+            f"--clip-duration must be a number ('30') or range ('30-45'), got {value!r}"
+        ) from exc
+    if lo <= 0 or hi <= 0:
+        raise argparse.ArgumentTypeError(
+            f"--clip-duration values must be > 0 seconds, got {value!r}"
+        )
+    if lo > hi:
+        raise argparse.ArgumentTypeError(
+            f"--clip-duration min must be <= max, got {value!r}"
+        )
+    return (lo, hi)
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description="AI YouTube Shorts Generator")
     parser.add_argument("url", help="YouTube URL, file:// URL, or local file path")
@@ -30,10 +59,13 @@ def main() -> int:
     parser.add_argument("--num-clips", type=int, default=3, help="How many shorts to render (default: 3)")
     parser.add_argument(
         "--clip-duration",
-        type=float,
+        type=_parse_clip_duration,
         default=None,
-        help="Force every short to be exactly this many seconds (e.g. 30). "
-             "Default: let the LLM pick from a 45-90s sweet spot.",
+        metavar="SECONDS",
+        help="Target clip length. Pass a single value for a fixed length "
+             "('--clip-duration 30') or a range for a window "
+             "('--clip-duration 30-45'). Default: LLM picks from a 45-90s "
+             "sweet spot.",
     )
     parser.add_argument("--aspect-ratio", default="9:16", help="Output aspect ratio (default: 9:16)")
     parser.add_argument("--format", default="720", help="Source download resolution: 360 / 480 / 720 / 1080 (default: 720)")

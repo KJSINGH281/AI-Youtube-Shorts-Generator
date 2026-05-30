@@ -49,7 +49,7 @@ Your task: identify the most viral-worthy highlights from the transcript.
 
 Rules:
 - Every highlight must open with a strong HOOK — a line that grabs attention within the first 3 seconds
-- Duration sweet spot: 45-90 seconds. Go shorter (20-44s) only for a perfect standalone one-liner. Go longer (91-180s) only when a story arc needs full context to land
+- {duration_rules}
 - Never cut mid-sentence or mid-thought — each clip must feel complete and self-contained
 - Clips must not overlap significantly with each other
 - Score 0-100 on viral potential (not general quality)
@@ -59,6 +59,34 @@ Rules:
 
 Respond ONLY with valid JSON (no markdown, no explanation):
 {{"highlights":[{{"title":"string","start_time":float,"end_time":float,"score":int,"hook_sentence":"string","virality_reason":"string"}}]}}"""
+
+
+DEFAULT_DURATION_RULES = (
+    "Duration sweet spot: 45-90 seconds. Go shorter (20-44s) only for a perfect "
+    "standalone one-liner. Go longer (91-180s) only when a story arc needs full "
+    "context to land"
+)
+
+
+def _duration_rules(clip_duration: Optional[float]) -> str:
+    """Build the duration-rules paragraph injected into the highlight prompt.
+
+    When `clip_duration` is set, we also snap clips to exactly that length
+    after the LLM step — but it still helps to nudge the LLM to pick start
+    points that read well at the target duration.
+    """
+    if not clip_duration or clip_duration <= 0:
+        return DEFAULT_DURATION_RULES
+    target = float(clip_duration)
+    lower = max(5.0, target * 0.85)
+    upper = target * 1.15
+    return (
+        f"Target duration: {target:.0f} seconds per clip. Aim for {lower:.0f}-"
+        f"{upper:.0f} seconds when picking start/end. Each clip will be trimmed "
+        f"to exactly {target:.0f} seconds afterwards, so pick a start_time where "
+        f"the hook lands in the first 3 seconds and the next {target:.0f} seconds "
+        f"stay self-contained"
+    )
 
 
 CHUNK_SIZE_SECONDS = 1200       # 20-min chunks for long videos
@@ -153,6 +181,7 @@ def call_highlight_api(
     num_clips: int,
     is_chunk: bool = False,
     llm_fn: LLMFn = call_muapi_llm,
+    clip_duration: Optional[float] = None,
 ) -> Dict:
     # Ask for ~2× the user's target so dedupe has headroom, but cap so the model
     # doesn't have to generate a huge JSON payload (which times out gpt-5-mini).
@@ -164,6 +193,7 @@ def call_highlight_api(
         content_type=content_info.get("content_type", "other"),
         density=content_info.get("density", "medium"),
         num_clips_instruction=f"Generate at least {min_clips} highlights",
+        duration_rules=_duration_rules(clip_duration),
     )
     full_prompt = f"{system}\n\nTranscript:\n{transcript_text}"
     raw = llm_fn(full_prompt)
@@ -191,20 +221,55 @@ def dedupe_highlights(highlights: List[Dict]) -> List[Dict]:
     return kept
 
 
+def snap_highlights_to_duration(
+    highlights: List[Dict],
+    clip_duration: float,
+    transcript_duration: Optional[float] = None,
+) -> List[Dict]:
+    """Force every highlight to be exactly `clip_duration` seconds long.
+
+    LLMs are unreliable at hitting exact durations, so when the caller asks
+    for (e.g.) 30-second shorts we anchor on the highlight's start_time and
+    extend/trim to exactly that length. If the highlight runs past the end
+    of the source video, we shift the window backward so the clip stays
+    in-bounds and still ends at the source duration.
+    """
+    if not clip_duration or clip_duration <= 0:
+        return highlights
+    snapped: List[Dict] = []
+    for h in highlights:
+        start = float(h["start_time"])
+        end = start + float(clip_duration)
+        if transcript_duration is not None and end > transcript_duration:
+            end = float(transcript_duration)
+            start = max(0.0, end - float(clip_duration))
+        if start < 0:
+            start = 0.0
+            end = start + float(clip_duration)
+        snapped.append({**h, "start_time": start, "end_time": end})
+    return snapped
+
+
 def get_highlights(
     transcript: Dict,
     num_clips: int = 3,
     llm_fn: Optional[LLMFn] = None,
+    clip_duration: Optional[float] = None,
 ) -> Dict:
     """Main entry point — returns {highlights: [...]} sorted by score.
 
     `llm_fn` swaps the underlying LLM. Defaults to MuAPI gpt-5-mini; local
     mode passes in a local LLM-backed callable.
+
+    `clip_duration` (seconds), when set, both nudges the LLM toward that
+    target and snaps every returned highlight to exactly that length.
     """
     llm_fn = llm_fn or call_muapi_llm
     duration = transcript.get("duration", 0)
     content_info = detect_content_type(transcript, llm_fn=llm_fn)
     print(f"[highlights] content={content_info.get('content_type')} density={content_info.get('density')} duration={duration:.0f}s", flush=True)
+    if clip_duration:
+        print(f"[highlights] target clip duration: {clip_duration:.0f}s (will snap after LLM)", flush=True)
 
     if duration >= LONG_VIDEO_THRESHOLD:
         chunks = chunk_transcript(transcript)
@@ -214,7 +279,15 @@ def get_highlights(
             offset = chunk.get("_offset", 0)
             text = build_transcript_text(chunk)
             print(f"[highlights] chunk {i + 1}/{len(chunks)} (offset {offset:.0f}s)", flush=True)
-            result = call_highlight_api(text, content_info, chunk["duration"], num_clips=num_clips, is_chunk=True, llm_fn=llm_fn)
+            result = call_highlight_api(
+                text,
+                content_info,
+                chunk["duration"],
+                num_clips=num_clips,
+                is_chunk=True,
+                llm_fn=llm_fn,
+                clip_duration=clip_duration,
+            )
             for h in result.get("highlights", []):
                 h["start_time"] = float(h["start_time"]) + offset
                 h["end_time"] = float(h["end_time"]) + offset
@@ -222,7 +295,19 @@ def get_highlights(
         highlights = dedupe_highlights(all_highlights)
     else:
         text = build_transcript_text(transcript)
-        result = call_highlight_api(text, content_info, duration, num_clips=num_clips, llm_fn=llm_fn)
+        result = call_highlight_api(
+            text,
+            content_info,
+            duration,
+            num_clips=num_clips,
+            llm_fn=llm_fn,
+            clip_duration=clip_duration,
+        )
         highlights = dedupe_highlights(result.get("highlights", []))
+
+    if clip_duration:
+        highlights = snap_highlights_to_duration(
+            highlights, clip_duration, transcript_duration=duration or None
+        )
 
     return {"highlights": highlights}

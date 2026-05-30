@@ -20,6 +20,7 @@ def _run_local(
     aspect_ratio: str,
     download_format: str,
     language: Optional[str],
+    clip_duration: Optional[float],
 ) -> Dict:
     from .local.clipper import crop_highlights_local
     from .local.downloader import download_youtube_local
@@ -34,7 +35,12 @@ def _run_local(
             "Whisper produced no segments. The video may have no detectable speech."
         )
 
-    highlights_result = get_highlights(transcript, num_clips=num_clips, llm_fn=call_local_llm)
+    highlights_result = get_highlights(
+        transcript,
+        num_clips=num_clips,
+        llm_fn=call_local_llm,
+        clip_duration=clip_duration,
+    )
     all_highlights: List[Dict] = highlights_result.get("highlights", [])
     if not all_highlights:
         raise RuntimeError("Highlight generator returned zero clips.")
@@ -59,6 +65,7 @@ def _run_api(
     aspect_ratio: str,
     download_format: str,
     language: Optional[str],
+    clip_duration: Optional[float],
 ) -> Dict:
     source_url = download_youtube(youtube_url, fmt=download_format)
 
@@ -68,7 +75,12 @@ def _run_api(
             "Whisper produced no segments. The video may have no detectable speech."
         )
 
-    highlights_result = get_highlights(transcript, num_clips=num_clips, llm_fn=call_muapi_llm)
+    highlights_result = get_highlights(
+        transcript,
+        num_clips=num_clips,
+        llm_fn=call_muapi_llm,
+        clip_duration=clip_duration,
+    )
     all_highlights: List[Dict] = highlights_result.get("highlights", [])
     if not all_highlights:
         raise RuntimeError("Highlight generator returned zero clips.")
@@ -94,6 +106,7 @@ def generate_shorts(
     download_format: str = "720",
     language: Optional[str] = None,
     mode: str = "api",
+    clip_duration: Optional[float] = None,
 ) -> Dict:
     """Run the full pipeline and return a structured result.
 
@@ -105,6 +118,9 @@ def generate_shorts(
         language: ISO-639-1 to force Whisper language detection.
         mode: "api" (default, MuAPI) or "local" (yt-dlp + faster-whisper +
             OpenAI or Gemini + ffmpeg).
+        clip_duration: when set, every rendered short is exactly this many
+            seconds long (the LLM picks the start point, we trim/extend to
+            hit the target). Leave as None for the default 45-90s sweet spot.
 
     Returns:
         {
@@ -117,7 +133,7 @@ def generate_shorts(
     """
     mode = (mode or "api").lower()
     if mode == "local":
-        return _run_local(youtube_url, num_clips, aspect_ratio, download_format, language)
+        return _run_local(youtube_url, num_clips, aspect_ratio, download_format, language, clip_duration)
     if mode == "api":
-        return _run_api(youtube_url, num_clips, aspect_ratio, download_format, language)
+        return _run_api(youtube_url, num_clips, aspect_ratio, download_format, language, clip_duration)
     raise ValueError(f"Unknown mode: {mode!r}. Use 'api' or 'local'.")

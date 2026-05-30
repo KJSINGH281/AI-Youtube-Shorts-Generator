@@ -28,6 +28,13 @@ def main() -> int:
         help="api (default, MuAPI) or local (remote URL, file://, or local path + faster-whisper + LLM provider + ffmpeg).",
     )
     parser.add_argument("--num-clips", type=int, default=3, help="How many shorts to render (default: 3)")
+    parser.add_argument(
+        "--clip-duration",
+        type=float,
+        default=None,
+        help="Force every short to be exactly this many seconds (e.g. 30). "
+             "Default: let the LLM pick from a 45-90s sweet spot.",
+    )
     parser.add_argument("--aspect-ratio", default="9:16", help="Output aspect ratio (default: 9:16)")
     parser.add_argument("--format", default="720", help="Source download resolution: 360 / 480 / 720 / 1080 (default: 720)")
     parser.add_argument("--language", default=None, help="Force Whisper language code, e.g. 'en' (default: auto-detect)")
@@ -42,6 +49,7 @@ def main() -> int:
             download_format=args.format,
             language=args.language,
             mode=args.mode,
+            clip_duration=args.clip_duration,
         )
     except Exception as e:
         print(f"\nFAILED: {e}", file=sys.stderr)

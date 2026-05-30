@@ -6,12 +6,54 @@ Two modes:
   * mode="local"            — yt-dlp + faster-whisper + OpenAI or Gemini + ffmpeg/opencv.
                               Self-hosted, LLM_PROVIDER selects OpenAI or Gemini.
 """
-from typing import Dict, List, Optional
+from typing import Dict, List, Optional, Tuple, Union
 
 from .clipper import crop_highlights
 from .downloader import download_youtube
 from .highlights import call_muapi_llm, get_highlights
 from .transcriber import transcribe
+
+
+ClipDurationInput = Union[None, float, int, str, Tuple[float, float]]
+ClipDurationRange = Optional[Tuple[float, float]]
+
+
+def _normalize_clip_duration(value: ClipDurationInput) -> ClipDurationRange:
+    """Coerce CLI/python-API inputs into a (min, max) tuple.
+
+    Accepts:
+      - None                         → None
+      - 30 / 30.0                    → (30.0, 30.0)
+      - "30"                         → (30.0, 30.0)
+      - "30-45"                      → (30.0, 45.0)
+      - (30, 45) / [30, 45]          → (30.0, 45.0)
+    """
+    if value is None:
+        return None
+    if isinstance(value, (int, float)):
+        v = float(value)
+        if v <= 0:
+            raise ValueError(f"clip_duration must be > 0, got {value!r}")
+        return (v, v)
+    if isinstance(value, str):
+        s = value.strip()
+        if "-" in s:
+            lo_str, hi_str = s.split("-", 1)
+            lo, hi = float(lo_str), float(hi_str)
+        else:
+            lo = hi = float(s)
+    elif isinstance(value, (tuple, list)) and len(value) == 2:
+        lo, hi = float(value[0]), float(value[1])
+    else:
+        raise TypeError(
+            f"clip_duration must be a number, '30-45' string, or (min,max) "
+            f"tuple — got {value!r}"
+        )
+    if lo <= 0 or hi <= 0:
+        raise ValueError(f"clip_duration values must be > 0, got {value!r}")
+    if lo > hi:
+        raise ValueError(f"clip_duration min must be <= max, got {value!r}")
+    return (lo, hi)
 
 
 def _run_local(
@@ -20,6 +62,7 @@ def _run_local(
     aspect_ratio: str,
     download_format: str,
     language: Optional[str],
+    clip_duration: ClipDurationRange,
 ) -> Dict:
     from .local.clipper import crop_highlights_local
     from .local.downloader import download_youtube_local
@@ -34,7 +77,12 @@ def _run_local(
             "Whisper produced no segments. The video may have no detectable speech."
         )
 
-    highlights_result = get_highlights(transcript, num_clips=num_clips, llm_fn=call_local_llm)
+    highlights_result = get_highlights(
+        transcript,
+        num_clips=num_clips,
+        llm_fn=call_local_llm,
+        clip_duration=clip_duration,
+    )
     all_highlights: List[Dict] = highlights_result.get("highlights", [])
     if not all_highlights:
         raise RuntimeError("Highlight generator returned zero clips.")
@@ -59,6 +107,7 @@ def _run_api(
     aspect_ratio: str,
     download_format: str,
     language: Optional[str],
+    clip_duration: ClipDurationRange,
 ) -> Dict:
     source_url = download_youtube(youtube_url, fmt=download_format)
 
@@ -68,7 +117,12 @@ def _run_api(
             "Whisper produced no segments. The video may have no detectable speech."
         )
 
-    highlights_result = get_highlights(transcript, num_clips=num_clips, llm_fn=call_muapi_llm)
+    highlights_result = get_highlights(
+        transcript,
+        num_clips=num_clips,
+        llm_fn=call_muapi_llm,
+        clip_duration=clip_duration,
+    )
     all_highlights: List[Dict] = highlights_result.get("highlights", [])
     if not all_highlights:
         raise RuntimeError("Highlight generator returned zero clips.")
@@ -94,6 +148,7 @@ def generate_shorts(
     download_format: str = "720",
     language: Optional[str] = None,
     mode: str = "api",
+    clip_duration: ClipDurationInput = None,
 ) -> Dict:
     """Run the full pipeline and return a structured result.
 
@@ -105,6 +160,10 @@ def generate_shorts(
         language: ISO-639-1 to force Whisper language detection.
         mode: "api" (default, MuAPI) or "local" (yt-dlp + faster-whisper +
             OpenAI or Gemini + ffmpeg).
+        clip_duration: target clip length. Pass `30` (or `(30, 30)`) for a
+            fixed length, or `(30, 45)` / `"30-45"` for a range — clips
+            inside the range are kept as-is and clips outside are clamped to
+            the nearest edge. Leave as None for the default 45-90s sweet spot.
 
     Returns:
         {
@@ -115,9 +174,10 @@ def generate_shorts(
           "shorts": [...],           # top `num_clips` with clip_url / local path
         }
     """
+    clip_range = _normalize_clip_duration(clip_duration)
     mode = (mode or "api").lower()
     if mode == "local":
-        return _run_local(youtube_url, num_clips, aspect_ratio, download_format, language)
+        return _run_local(youtube_url, num_clips, aspect_ratio, download_format, language, clip_range)
     if mode == "api":
-        return _run_api(youtube_url, num_clips, aspect_ratio, download_format, language)
+        return _run_api(youtube_url, num_clips, aspect_ratio, download_format, language, clip_range)
     raise ValueError(f"Unknown mode: {mode!r}. Use 'api' or 'local'.")
